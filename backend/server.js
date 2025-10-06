@@ -11,6 +11,7 @@ const rateLimit = require("express-rate-limit");
 require("dotenv").config();
 
 const app = express();
+app.set('trust proxy', 1);
 const PORT = process.env.PORT || 3001;
 
 // Security middleware
@@ -22,8 +23,8 @@ app.use(
 
 // Rate limiting
 const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 1000, // زيادة العدد لـ 1000 طلب
+  windowMs: 15 * 60 * 1000,
+  max: 1000,
 });
 app.use("/api/", limiter);
 
@@ -44,8 +45,18 @@ if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
 }
 
-// Serve uploaded files
+// Serve uploaded files with category folders
 app.use("/uploads", express.static(uploadsDir));
+app.use("/uploads", (req, res, next) => {
+  const categoryMatch = req.path.match(/^\/category_(\d+)\//);
+  if (categoryMatch) {
+    return express.static(uploadsDir)(req, res, next);
+  }
+  next();
+});
+
+// Serve old structure
+app.use("/uplods", express.static("/home/hacokw/public_html/uplods"));
 
 // Database setup
 const dbPath = process.env.DB_PATH || "./database/app.db";
@@ -56,9 +67,31 @@ if (!fs.existsSync(dbDir)) {
 
 const db = new sqlite3.Database(dbPath);
 
+// Simple in-memory cache
+let categoriesCache = null;
+let cacheTimestamp = null;
+const CACHE_DURATION = 10 * 60 * 1000;
+
+const clearCache = () => {
+  categoriesCache = null;
+  cacheTimestamp = null;
+  console.log("Cache cleared");
+};
+
+const getCache = () => {
+  if (categoriesCache && cacheTimestamp && Date.now() - cacheTimestamp < CACHE_DURATION) {
+    return categoriesCache;
+  }
+  return null;
+};
+
+const setCache = (data) => {
+  categoriesCache = data;
+  cacheTimestamp = Date.now();
+};
+
 // Initialize database tables
 db.serialize(() => {
-  // Categories table
   db.run(`
     CREATE TABLE IF NOT EXISTS categories (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -71,7 +104,6 @@ db.serialize(() => {
     )
   `);
 
-  // Images table
   db.run(`
     CREATE TABLE IF NOT EXISTS images (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -83,12 +115,12 @@ db.serialize(() => {
       video_url TEXT,
       file_size INTEGER,
       mime_type TEXT,
+      image_url TEXT,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (category_id) REFERENCES categories (id) ON DELETE CASCADE
     )
   `);
 
-  // Admin users table
   db.run(`
     CREATE TABLE IF NOT EXISTS admin_users (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -97,12 +129,73 @@ db.serialize(() => {
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )
   `);
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS properties (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      category_id INTEGER NOT NULL,
+      title_en TEXT,
+      title_ar TEXT,
+      description_en TEXT,
+      description_ar TEXT,
+      featured INTEGER DEFAULT 0,
+      location TEXT,
+      video_url TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (category_id) REFERENCES categories (id) ON DELETE CASCADE
+    )
+  `);
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS property_images (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      property_id INTEGER NOT NULL,
+      image_url TEXT NOT NULL,
+      title_en TEXT,
+      title_ar TEXT,
+      sort_order INTEGER DEFAULT 0,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (property_id) REFERENCES properties (id) ON DELETE CASCADE
+    )
+  `);
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS contact_info (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      type TEXT NOT NULL,
+      value TEXT NOT NULL,
+      label_en TEXT,
+      label_ar TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS companies (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name_en TEXT NOT NULL,
+      name_ar TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
 });
 
-// Multer configuration for file uploads
+// Multer configuration
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
-    cb(null, uploadsDir);
+    const categoryId = req.body.category_id;
+    
+    if (categoryId) {
+      const categoryFolder = path.join(uploadsDir, `category_${categoryId}`);
+      
+      if (!fs.existsSync(categoryFolder)) {
+        fs.mkdirSync(categoryFolder, { recursive: true });
+      }
+      
+      cb(null, categoryFolder);
+    } else {
+      cb(null, uploadsDir);
+    }
   },
   filename: (req, file, cb) => {
     const uniqueSuffix = Date.now() + "-" + Math.round(Math.random() * 1e9);
@@ -127,12 +220,12 @@ const fileFilter = (req, file, cb) => {
 const upload = multer({
   storage: storage,
   limits: {
-    fileSize: parseInt(process.env.MAX_FILE_SIZE) || 10 * 1024 * 1024, // 10MB default
+    fileSize: parseInt(process.env.MAX_FILE_SIZE) || 10 * 1024 * 1024,
   },
   fileFilter: fileFilter,
 });
 
-// JWT middleware
+// JWT middleware - MUST be defined before using it
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers["authorization"];
   const token = authHeader && authHeader.split(" ")[1];
@@ -222,25 +315,26 @@ app.post("/api/login", async (req, res) => {
     res.status(500).json({ error: "Server error" });
   }
 });
-// استبدل الـ route ده في ملف server.js
+
+// Clear cache endpoint
+app.post("/api/cache/clear", authenticateToken, (req, res) => {
+  clearCache();
+  res.json({
+    success: true,
+    message: "Cache cleared successfully"
+  });
+});
 
 // Get all categories with images
-// استبدل الـ categories route في server.js بالكود ده:
-
-// Get all categories with images
-// استبدل الـ categories route في server.js بهذا الكود البسيط:
-// Get all categories with properties and their images
-const NodeCache = require("node-cache");
-const cache = new NodeCache({ stdTTL: 600 }); // cache for 10 minutes
-
 app.get("/api/categories", (req, res) => {
-  console.log("🔍 Fetching categories with properties and images...");
-  const cacheKey = "categories";
-  const cachedData = cache.get(cacheKey);
-  if (cachedData) {
+  console.log("Fetching categories...");
+  
+  const cachedData = getCache();
+  if (cachedData && !req.query.t) {
+    console.log("Serving from cache");
     return res.json(cachedData);
   }
-  // Get categories
+
   const categoriesQuery = `
     SELECT 
       c.id,
@@ -256,186 +350,194 @@ app.get("/api/categories", (req, res) => {
 
   db.all(categoriesQuery, [], (err, categories) => {
     if (err) {
-      console.error("❌ Database error fetching categories:", err);
+      console.error("Database error fetching categories:", err);
       return res.status(500).json({ error: "Database error" });
     }
 
-    console.log("📁 Categories found:", categories.length);
+    console.log("Categories found:", categories.length);
 
     if (categories.length === 0) {
+      setCache([]);
       return res.json([]);
     }
 
-    // Get all properties for these categories
     const categoryIds = categories.map((cat) => cat.id);
     const placeholders = categoryIds.map(() => "?").join(",");
 
-    const propertiesQuery = `
+    const imagesQuery = `
       SELECT 
-        p.id,
-        p.category_id,
-        p.title_en,
-        p.title_ar,
-        p.description_en,
-        p.description_ar,
-        p.featured,
-        p.location,
-        p.video_url,
-        p.created_at
-      FROM properties p
-      WHERE p.category_id IN (${placeholders})
-      ORDER BY p.featured DESC, p.created_at DESC
+        i.id,
+        i.category_id,
+        i.filename,
+        i.original_name,
+        i.title,
+        i.title_ar,
+        i.video_url,
+        i.image_url,
+        i.created_at
+      FROM images i
+      WHERE i.category_id IN (${placeholders})
+      ORDER BY i.created_at DESC
     `;
 
-    db.all(propertiesQuery, categoryIds, (err, properties) => {
+    db.all(imagesQuery, categoryIds, (err, images) => {
       if (err) {
-        console.error("❌ Database error fetching properties:", err);
+        console.error("Database error fetching images:", err);
         return res.status(500).json({ error: "Database error" });
       }
 
-      console.log("🏠 Properties found:", properties.length);
+      console.log("Direct images found:", images.length);
 
-      if (properties.length === 0) {
-        // إرجاع الكاتيجوريز فاضية لو مفيش properties
-        const result = categories.map((category) => ({
-          id: category.id,
-          name: category.name,
-          name_ar: category.name_ar,
-          description: category.description,
-          description_ar: category.description_ar,
-          created_at: category.created_at,
-          updated_at: category.updated_at,
-          images: [],
-        }));
-        return res.json(result);
-      }
-
-      // Get all property images
-      const propertyIds = properties.map((prop) => prop.id);
-      const propertyPlaceholders = propertyIds.map(() => "?").join(",");
-
-      const imagesQuery = `
+      const propertiesQuery = `
         SELECT 
-          pi.id,
-          pi.property_id,
-          pi.image_url,
-          pi.title_en,
-          pi.title_ar,
-          pi.sort_order,
-          pi.created_at
-        FROM property_images pi
-        WHERE pi.property_id IN (${propertyPlaceholders})
-        ORDER BY pi.property_id, pi.sort_order ASC
+          p.id,
+          p.category_id,
+          p.title_en,
+          p.title_ar,
+          p.video_url,
+          p.location
+        FROM properties p
+        WHERE p.category_id IN (${placeholders})
       `;
 
-      db.all(imagesQuery, propertyIds, (err, propertyImages) => {
+      db.all(propertiesQuery, categoryIds, (err, properties) => {
         if (err) {
-          console.error("❌ Database error fetching property images:", err);
+          console.error("Database error fetching properties:", err);
           return res.status(500).json({ error: "Database error" });
         }
 
-        console.log("🖼️ Property images found:", propertyImages.length);
+        console.log("Properties found:", properties.length);
 
-        // Group images by property_id
-        const imagesByProperty = {};
-        propertyImages.forEach((image) => {
-          if (!imagesByProperty[image.property_id]) {
-            imagesByProperty[image.property_id] = [];
-          }
-          imagesByProperty[image.property_id].push(image);
-        });
-
-        // Group properties by category_id
-        const propertiesByCategory = {};
-        properties.forEach((property) => {
-          if (!propertiesByCategory[property.category_id]) {
-            propertiesByCategory[property.category_id] = [];
-          }
-
-          // Add images to each property
-          const propertyWithImages = {
-            ...property,
-            images: (imagesByProperty[property.id] || []).map((img) => ({
-              id: img.id,
-              image_url: img.image_url,
-              title_en: img.title_en,
-              title_ar: img.title_ar,
-              sort_order: img.sort_order,
-            })),
-          };
-
-          propertiesByCategory[property.category_id].push(propertyWithImages);
-        });
-
-        // Convert properties to images format for frontend compatibility
-        const result = categories.map((category) => {
-          const categoryProperties = propertiesByCategory[category.id] || [];
-
-          // تحويل كل property لصورة منفصلة للتوافق مع الفرونت إند
-          const images = [];
-          categoryProperties.forEach((property) => {
-            if (property.images && property.images.length > 0) {
-              property.images.forEach((image, index) => {
-                images.push({
-                  id: `${property.id}-${image.id}`,
-                  title: property.title_en,
-                  title_ar: property.title_ar,
-                  title_en: property.title_en,
-                  image_url: image.image_url,
-                  video_url: property.video_url,
-                  location: property.location,
-                  featured: property.featured === 1,
-                  description_en: property.description_en,
-                  description_ar: property.description_ar,
-                  sort_order: image.sort_order,
-                  property_data: property, // احتفظ بكامل بيانات الProperty
-                });
-              });
-            } else {
-              // لو مفيش صور للproperty، اعمله entry فاضي
-              images.push({
-                id: property.id,
-                title: property.title_en,
-                title_ar: property.title_ar,
-                title_en: property.title_en,
-                image_url: null,
-                video_url: property.video_url,
-                location: property.location,
-                featured: property.featured === 1,
-                description_en: property.description_en,
-                description_ar: property.description_ar,
-                property_data: property,
-              });
+        if (properties.length === 0) {
+          const imagesByCategory = {};
+          images.forEach((image) => {
+            if (!imagesByCategory[image.category_id]) {
+              imagesByCategory[image.category_id] = [];
             }
+            imagesByCategory[image.category_id].push({
+              id: image.id,
+              title: image.title,
+              title_ar: image.title_ar,
+              title_en: image.title,
+              filename: image.filename,
+              original_name: image.original_name,
+              image_url: image.image_url || (image.filename ? `/uploads/${image.filename}` : null),
+              video_url: image.video_url,
+              created_at: image.created_at
+            });
           });
 
-          return {
+          const result = categories.map((category) => ({
             id: category.id,
             name: category.name,
             name_ar: category.name_ar,
-            name_en: category.name, // للتوافق
+            name_en: category.name,
             description: category.description,
             description_ar: category.description_ar,
-            description_en: category.description, // للتوافق
+            description_en: category.description,
             created_at: category.created_at,
             updated_at: category.updated_at,
-            images: images,
-          };
+            images: imagesByCategory[category.id] || []
+          }));
+
+          setCache(result);
+          return res.json(result);
+        }
+
+        const propertyIds = properties.map(p => p.id);
+        const propPlaceholders = propertyIds.map(() => "?").join(",");
+
+        const propertyImagesQuery = `
+          SELECT 
+            pi.id,
+            pi.property_id,
+            pi.image_url,
+            pi.title_en,
+            pi.title_ar,
+            pi.sort_order
+          FROM property_images pi
+          WHERE pi.property_id IN (${propPlaceholders})
+          ORDER BY pi.property_id, pi.sort_order
+        `;
+
+        db.all(propertyImagesQuery, propertyIds, (err, propertyImages) => {
+          if (err) {
+            console.error("Database error fetching property images:", err);
+            return res.status(500).json({ error: "Database error" });
+          }
+
+          console.log("Property images found:", propertyImages.length);
+
+          const imagesByProperty = {};
+          propertyImages.forEach((img) => {
+            if (!imagesByProperty[img.property_id]) {
+              imagesByProperty[img.property_id] = [];
+            }
+            imagesByProperty[img.property_id].push(img);
+          });
+
+          const imagesByCategory = {};
+
+          images.forEach((image) => {
+            if (!imagesByCategory[image.category_id]) {
+              imagesByCategory[image.category_id] = [];
+            }
+            imagesByCategory[image.category_id].push({
+              id: image.id,
+              title: image.title,
+              title_ar: image.title_ar,
+              title_en: image.title,
+              filename: image.filename,
+              original_name: image.original_name,
+              image_url: image.image_url || (image.filename ? `/uploads/${image.filename}` : null),
+              video_url: image.video_url,
+              created_at: image.created_at
+            });
+          });
+
+          properties.forEach((property) => {
+            const propImages = imagesByProperty[property.id] || [];
+            propImages.forEach((img) => {
+              if (!imagesByCategory[property.category_id]) {
+                imagesByCategory[property.category_id] = [];
+              }
+              imagesByCategory[property.category_id].push({
+                id: `prop_${img.id}`,
+                title: property.title_en,
+                title_ar: property.title_ar,
+                title_en: property.title_en,
+                filename: null,
+                image_url: img.image_url,
+                video_url: property.video_url,
+                location: property.location,
+                created_at: img.created_at
+              });
+            });
+          });
+
+          const result = categories.map((category) => ({
+            id: category.id,
+            name: category.name,
+            name_ar: category.name_ar,
+            name_en: category.name,
+            description: category.description,
+            description_ar: category.description_ar,
+            description_en: category.description,
+            created_at: category.created_at,
+            updated_at: category.updated_at,
+            images: imagesByCategory[category.id] || []
+          }));
+
+          console.log("Returning", result.length, "categories with images");
+          setCache(result);
+          res.json(result);
         });
-
-        console.log("📤 Returning", result.length, "categories");
-        console.log(
-          "🖼️ Total images distributed:",
-          result.reduce((sum, cat) => sum + cat.images.length, 0)
-        );
-
-        res.json(result);
       });
     });
   });
-  cache.set(cacheKey, result);
-  res.json(result);
-}); // Create new category
+});
+
+// Create new category
 app.post("/api/categories", authenticateToken, (req, res) => {
   const { name, name_ar, description, description_ar } = req.body;
 
@@ -450,8 +552,12 @@ app.post("/api/categories", authenticateToken, (req, res) => {
 
   db.run(query, [name, name_ar, description, description_ar], function (err) {
     if (err) {
+      console.error("Error creating category:", err);
       return res.status(500).json({ error: "Database error" });
     }
+
+    clearCache();
+    console.log("Category created, cache cleared");
 
     res.json({
       success: true,
@@ -481,12 +587,16 @@ app.put("/api/categories/:id", authenticateToken, (req, res) => {
     [name, name_ar, description, description_ar, id],
     function (err) {
       if (err) {
+        console.error("Error updating category:", err);
         return res.status(500).json({ error: "Database error" });
       }
 
       if (this.changes === 0) {
         return res.status(404).json({ error: "Category not found" });
       }
+
+      clearCache();
+      console.log("Category updated, cache cleared");
 
       res.json({
         success: true,
@@ -500,32 +610,36 @@ app.put("/api/categories/:id", authenticateToken, (req, res) => {
 app.delete("/api/categories/:id", authenticateToken, (req, res) => {
   const { id } = req.params;
 
-  // First, get all images for this category to delete files
   db.all(
     "SELECT filename FROM images WHERE category_id = ?",
     [id],
     (err, images) => {
       if (err) {
+        console.error("Error fetching images:", err);
         return res.status(500).json({ error: "Database error" });
       }
 
-      // Delete image files
       images.forEach((image) => {
-        const filePath = path.join(uploadsDir, image.filename);
-        if (fs.existsSync(filePath)) {
-          fs.unlinkSync(filePath);
+        if (image.filename) {
+          const filePath = path.join(uploadsDir, image.filename);
+          if (fs.existsSync(filePath)) {
+            fs.unlinkSync(filePath);
+          }
         }
       });
 
-      // Delete category (images will be deleted by CASCADE)
       db.run("DELETE FROM categories WHERE id = ?", [id], function (err) {
         if (err) {
+          console.error("Error deleting category:", err);
           return res.status(500).json({ error: "Database error" });
         }
 
         if (this.changes === 0) {
           return res.status(404).json({ error: "Category not found" });
         }
+
+        clearCache();
+        console.log("Category deleted, cache cleared");
 
         res.json({
           success: true,
@@ -537,13 +651,11 @@ app.delete("/api/categories/:id", authenticateToken, (req, res) => {
 });
 
 // Upload image
-// Upload image
 app.post(
   "/api/images",
   authenticateToken,
   upload.single("image"),
   (req, res) => {
-    // إذا لم يكن هناك ملف مرفوع، يجب أن يكون هناك image_url
     if (!req.file && !req.body.image_url) {
       return res
         .status(400)
@@ -553,14 +665,12 @@ app.post(
     const { category_id, title, title_ar, video_url, image_url } = req.body;
 
     if (!category_id) {
-      // Delete uploaded file if category_id is missing
       if (req.file) {
         fs.unlinkSync(req.file.path);
       }
       return res.status(400).json({ error: "Category ID is required" });
     }
 
-    // تحديد القيم بناءً على وجود الملف أو الـ URL
     const filename = req.file ? req.file.filename : null;
     const originalName = req.file ? req.file.originalname : null;
     const fileSize = req.file ? req.file.size : null;
@@ -568,9 +678,9 @@ app.post(
     const imageUrl = image_url || null;
 
     const query = `
-    INSERT INTO images (category_id, filename, original_name, title, title_ar, video_url, file_size, mime_type, image_url)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `;
+      INSERT INTO images (category_id, filename, original_name, title, title_ar, video_url, file_size, mime_type, image_url)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `;
 
     db.run(
       query,
@@ -587,12 +697,15 @@ app.post(
       ],
       function (err) {
         if (err) {
-          // Delete uploaded file if database insert fails
           if (req.file) {
             fs.unlinkSync(req.file.path);
           }
+          console.error("Error uploading image:", err);
           return res.status(500).json({ error: "Database error" });
         }
+
+        clearCache();
+        console.log("Image uploaded, cache cleared");
 
         const responseUrl = imageUrl || `/uploads/${filename}`;
 
@@ -613,9 +726,9 @@ app.post(
 app.delete("/api/images/:id", authenticateToken, (req, res) => {
   const { id } = req.params;
 
-  // First get the filename to delete the file
   db.get("SELECT filename FROM images WHERE id = ?", [id], (err, row) => {
     if (err) {
+      console.error("Error fetching image:", err);
       return res.status(500).json({ error: "Database error" });
     }
 
@@ -623,17 +736,21 @@ app.delete("/api/images/:id", authenticateToken, (req, res) => {
       return res.status(404).json({ error: "Image not found" });
     }
 
-    // Delete the file
-    const filePath = path.join(uploadsDir, row.filename);
-    if (fs.existsSync(filePath)) {
-      fs.unlinkSync(filePath);
+    if (row.filename) {
+      const filePath = path.join(uploadsDir, row.filename);
+      if (fs.existsSync(filePath)) {
+        fs.unlinkSync(filePath);
+      }
     }
 
-    // Delete from database
     db.run("DELETE FROM images WHERE id = ?", [id], function (err) {
       if (err) {
+        console.error("Error deleting image:", err);
         return res.status(500).json({ error: "Database error" });
       }
+
+      clearCache();
+      console.log("Image deleted, cache cleared");
 
       res.json({
         success: true,
@@ -643,7 +760,6 @@ app.delete("/api/images/:id", authenticateToken, (req, res) => {
   });
 });
 
-// Health check endpoint
 // Get contact information
 app.get("/api/contact", (req, res) => {
   const contactQuery = `
@@ -658,7 +774,6 @@ app.get("/api/contact", (req, res) => {
       return res.status(500).json({ error: "Database error" });
     }
 
-    // Group contacts by type
     const contactInfo = {};
     contacts.forEach((contact) => {
       if (!contactInfo[contact.type]) {
@@ -693,113 +808,7 @@ app.get("/api/companies", (req, res) => {
   });
 });
 
-// Create property with images
-app.post("/api/properties", authenticateToken, (req, res) => {
-  const {
-    category_id,
-    title_en,
-    title_ar,
-    description_en,
-    description_ar,
-    location,
-    video_url,
-    featured,
-    images,
-  } = req.body;
-
-  if (!category_id) {
-    return res.status(400).json({ error: "Category ID is required" });
-  }
-
-  const query = `
-    INSERT INTO properties (category_id, title_en, title_ar, description_en, description_ar, location, video_url, featured)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `;
-
-  db.run(
-    query,
-    [
-      category_id,
-      title_en,
-      title_ar,
-      description_en,
-      description_ar,
-      location,
-      video_url,
-      featured ? 1 : 0,
-    ],
-    function (err) {
-      if (err) {
-        return res.status(500).json({ error: "Database error" });
-      }
-
-      const propertyId = this.lastID;
-
-      // Insert images if provided
-      if (images && images.length > 0) {
-        const imageStmt = db.prepare(`
-        INSERT INTO property_images (property_id, image_url, title_en, title_ar, sort_order)
-        VALUES (?, ?, ?, ?, ?)
-      `);
-
-        images.forEach((image, index) => {
-          imageStmt.run(
-            propertyId,
-            image.url,
-            image.title_en || null,
-            image.title_ar || null,
-            index
-          );
-        });
-
-        imageStmt.finalize();
-      }
-
-      res.json({
-        success: true,
-        id: propertyId,
-        message: "Property created successfully",
-      });
-    }
-  );
-});
-
-// Update contact information
-app.put("/api/contact", authenticateToken, (req, res) => {
-  const { contacts } = req.body;
-
-  if (!contacts || !Array.isArray(contacts)) {
-    return res.status(400).json({ error: "Contacts array is required" });
-  }
-
-  // Clear existing contacts and insert new ones
-  db.run("DELETE FROM contact_info", [], (err) => {
-    if (err) {
-      return res.status(500).json({ error: "Database error" });
-    }
-
-    const stmt = db.prepare(`
-      INSERT INTO contact_info (type, value, label_en, label_ar)
-      VALUES (?, ?, ?, ?)
-    `);
-
-    contacts.forEach((contact) => {
-      stmt.run(contact.type, contact.value, contact.label_en, contact.label_ar);
-    });
-
-    stmt.finalize((err) => {
-      if (err) {
-        return res.status(500).json({ error: "Database error" });
-      }
-
-      res.json({
-        success: true,
-        message: "Contact information updated successfully",
-      });
-    });
-  });
-});
-
+// Health check
 app.get("/api/health", (req, res) => {
   res.json({
     status: "OK",

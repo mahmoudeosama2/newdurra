@@ -6,6 +6,7 @@ import {
   Folder,
   LogOut,
   Plus,
+   RefreshCw,
   Trash2,
   Upload,
   X
@@ -146,7 +147,21 @@ const Dashboard = ({ user, onLogout }) => {
       showMessage(err.response?.data?.error || 'Failed to delete category', 'error');
     }
   };
-
+const handleClearCache = async () => {
+  try {
+    await axios.post(`${API_BASE_URL}/cache/clear`, {}, {
+      headers: getAuthHeaders()
+    });
+    showMessage('Cache cleared successfully');
+    fetchCategories();
+  } catch (err) {
+    if (err.response?.status === 401) {
+      onLogout();
+      return;
+    }
+    showMessage('Failed to clear cache', 'error');
+  }
+};
   const openEditCategory = (category) => {
     setEditingCategory(category);
     setCategoryForm({
@@ -221,20 +236,24 @@ const Dashboard = ({ user, onLogout }) => {
   };
 
   // Helper function to get images from category
-  const getCategoryImages = (category) => {
-    // Check if category has properties with images (new structure)
-    if (category.properties && category.properties.length > 0) {
-      const allImages = [];
-      category.properties.forEach(property => {
-        if (property.images && property.images.length > 0) {
-          allImages.push(...property.images);
-        }
-      });
-      return allImages;
-    }
-    // Fallback to direct images (old structure)
-    return category.images || [];
-  };
+// Helper function to get images from category
+const getCategoryImages = (category) => {
+  if (category.images && category.images.length > 0) {
+    return category.images;
+  }
+  
+  if (category.properties && category.properties.length > 0) {
+    const allImages = [];
+    category.properties.forEach(property => {
+      if (property.images && property.images.length > 0) {
+        allImages.push(...property.images);
+      }
+    });
+    return allImages;
+  }
+  
+  return [];
+};
 
   if (loading) {
     return (
@@ -298,7 +317,13 @@ const Dashboard = ({ user, onLogout }) => {
             Add Category
           </button>
         </div>
-
+<button
+  onClick={handleClearCache}
+  className="btn-secondary flex items-center gap-2"
+>
+  <RefreshCw className="w-4 h-4" />
+  Clear Cache
+</button>
         {/* Categories Grid */}
         <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-6">
           {categories.map((category) => {
@@ -357,8 +382,11 @@ const Dashboard = ({ user, onLogout }) => {
                   <div className="grid grid-cols-3 gap-2">
                     {categoryImages.slice(0, 6).map((image) => (
                       <div key={image.id} className="relative group">
-                        <img
-src={image.image_url || `${API_BASE_URL.replace('/api', '')}/uploads/${image.filename}`}
+                 <img
+  src={
+    image.image_url || 
+    (image.filename ? `${API_BASE_URL.replace('/api', '')}/uploads/${image.filename}` : null)
+  }
                           alt={image.title || image.title_en || image.original_name}
                           className="w-full h-16 object-cover rounded border"
                           onError={(e) => {
